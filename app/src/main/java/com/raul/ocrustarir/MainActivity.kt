@@ -29,6 +29,17 @@ import androidx.appcompat.app.AppCompatActivity
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.Executors
+import android.Manifest
+import android.content.pm.PackageManager
+import android.media.AudioFormat
+import android.media.AudioRecord
+import android.media.MediaRecorder
+import androidx.core.app.ActivityCompat
+import kotlin.math.sqrt
+import org.apache.commons.math3.transform.FastFourierTransformer
+import org.apache.commons.math3.transform.DftNormalization
+import org.apache.commons.math3.transform.TransformType
+import org.apache.commons.math3.complex.Complex
 
 class MainActivity : AppCompatActivity() {
 
@@ -146,6 +157,12 @@ class MainActivity : AppCompatActivity() {
     private var isSending = false // Flag to track sending state
     private var lastSentCommand: CommandData? = null // Keep track of the last sent command
 
+    // Add class variables
+    private var isSyncing = false
+    private var audioRecord: AudioRecord? = null
+    private var audioThread: Thread? = null
+    private lateinit var syncButton: Button
+
 
     companion object {
         private const val TAG = "ElkSmartComm"
@@ -160,6 +177,7 @@ class MainActivity : AppCompatActivity() {
         private val C_LEARN = byteArrayOf(-2, -2, -2, -2)
         private val C_STOP = byteArrayOf(-3, -3, -3, -3)
         private val C_IDENTIFY = byteArrayOf(-4, -4, -4, -4)
+        private const val REQUEST_RECORD_AUDIO = 1
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -178,37 +196,41 @@ class MainActivity : AppCompatActivity() {
         countEditText = createBoxedEditText("Count", InputType.TYPE_CLASS_NUMBER, "1")
         delayEditText = createBoxedEditText("Delay (seconds)", InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL, "0.5")
 
-
         // Stop Button
         stopButton = Button(this).apply {
             text = "Stop"
-            // Use createRoundedRectDrawable for rounded corners
             background = createRoundedRectDrawable(Color.RED, dpToPx(20)) // 20dp corner radius
             setTextColor(Color.WHITE)
-            setOnClickListener {
-                stopSending()
-            }
-            // Adjust layout parameters for smaller size
+            setOnClickListener { stopSending() }
             val size = dpToPx(40) // Example: 40dp x 40dp button
             layoutParams = LinearLayout.LayoutParams(size, size).apply {
-                //add margin
                 marginEnd = dpToPx(8)
             }
         }
 
-
+        // Input Layout (Row)
         val inputLayout = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
-            //count
             addView(countEditText, LinearLayout.LayoutParams(dpToPx(100), LinearLayout.LayoutParams.WRAP_CONTENT).apply { marginEnd = dpToPx(8) })
-            //delay
             addView(delayEditText, LinearLayout.LayoutParams(dpToPx(150), LinearLayout.LayoutParams.WRAP_CONTENT).apply { marginEnd = dpToPx(8) })
-            //stop button
             addView(stopButton, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT))
         }
 
-
+        // Sync Music Button (Fixed: Placed Below and Centered)
+        syncButton = Button(this).apply {
+            text = "Sync Music"
+            background = createRoundedRectDrawable(Color.BLUE, dpToPx(20))
+            setTextColor(Color.WHITE)
+            setOnClickListener { toggleAudioSync() }
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                topMargin = dpToPx(16) // Space below input layout
+                gravity = Gravity.CENTER_HORIZONTAL // Center it horizontally
+            }
+        }
 
         statusTextView = TextView(this).apply {
             gravity = Gravity.CENTER
@@ -216,17 +238,22 @@ class MainActivity : AppCompatActivity() {
             setPadding(dpToPx(16), dpToPx(16), dpToPx(16), dpToPx(16))
         }
 
-        //Main layout
+        // Main Layout
         val mainLayout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
             addView(statusTextView)
-            addView(inputLayout) // Add Input fields layout.
-            addView(scrollView) // Add the ScrollView containing button layout
+            addView(inputLayout) // Add input layout
+            addView(syncButton) // FIXED: Added below input layout and centered
+            addView(scrollView) // Add the ScrollView containing buttons
         }
+
         createCommandButtons()
 
         scrollView.addView(commandContainer)
         setContentView(mainLayout)
+
+
         // --- End UI Setup ---
 
         usbManager = getSystemService(Context.USB_SERVICE) as UsbManager
@@ -246,6 +273,173 @@ class MainActivity : AppCompatActivity() {
 
         findAndConnectDevice()
     }
+    private fun checkAudioPermission() {
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), REQUEST_RECORD_AUDIO)
+        } else {
+            startAudioSync()
+        }
+    }
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        when (requestCode) {
+            REQUEST_RECORD_AUDIO -> {
+                if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                    startAudioSync()
+                } else {
+                    statusTextView.text = "Microphone access required for music sync"
+                }
+            }
+        }
+    }
+    private fun nextPowerOf2(n: Int): Int {
+        var power = 1
+        while (power < n) {
+            power = power shl 1
+        }
+        return power
+    }
+    // Audio sync toggle function
+    private fun startAudioSync() {
+        val sampleRate = 44100
+        val bufferSize = AudioRecord.getMinBufferSize(
+            sampleRate,
+            AudioFormat.CHANNEL_IN_MONO,
+            AudioFormat.ENCODING_PCM_16BIT
+        )
+
+        if (bufferSize == AudioRecord.ERROR || bufferSize == AudioRecord.ERROR_BAD_VALUE) {
+            statusTextView.text = "Invalid audio buffer size"
+            return
+        }
+
+        // Calculate the nearest power of 2
+        val fftSize = nextPowerOf2(bufferSize)
+
+        try {
+            if (ActivityCompat.checkSelfPermission(
+                    this,
+                    Manifest.permission.RECORD_AUDIO
+                ) != PackageManager.PERMISSION_GRANTED
+            ) {
+                return
+            }
+            audioRecord = AudioRecord(
+                MediaRecorder.AudioSource.MIC,
+                sampleRate,
+                AudioFormat.CHANNEL_IN_MONO,
+                AudioFormat.ENCODING_PCM_16BIT,
+                bufferSize
+            )
+
+            if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
+                statusTextView.text = "Audio recorder not initialized"
+                return
+            }
+
+            audioRecord?.startRecording()
+            isSyncing = true
+            statusTextView.text = "Listening for beats..."
+
+        } catch (e: Exception) {
+            Log.e(TAG, "Audio init failed", e)
+            statusTextView.text = "Audio initialization failed: ${e.message}"
+            return
+        }
+
+        audioThread = Thread {
+            val buffer = ShortArray(bufferSize)
+            val transformer = FastFourierTransformer(DftNormalization.STANDARD)
+            val fftBuffer = DoubleArray(fftSize) // Use padded size
+            var lastBeat = 0L
+            val cooldown = 100
+
+            // Adjustable parameters
+            val threshold = 600000.0 // Increased threshold
+            val minEnergy = 500000.0 // Minimum energy required for a beat
+            val bassRangeStart = 0 // Start of bass range (inclusive)
+            val bassRangeEnd = 10 // End of bass range (exclusive)
+
+            while (isSyncing) {
+                try {
+                    val read = audioRecord?.read(buffer, 0, buffer.size) ?: 0
+                    if (read > 0) {
+                        // Convert audio samples to doubles for FFT
+                        for (i in 0 until read) {
+                            fftBuffer[i] = buffer[i].toDouble()
+                        }
+
+                        // Pad the remaining buffer with zeros
+                        for (i in read until fftSize) {
+                            fftBuffer[i] = 0.0
+                        }
+
+                        // Perform FFT
+                        val fftResult = transformer.transform(fftBuffer, TransformType.FORWARD)
+
+                        // Calculate magnitude for each frequency bin
+                        val magnitudes = DoubleArray(fftSize / 2)
+                        for (i in 0 until fftSize / 2) {
+                            val real = fftResult[i].real
+                            val imaginary = fftResult[i].imaginary
+                            magnitudes[i] = sqrt(real * real + imaginary * imaginary)
+                        }
+
+                        // Detect beats in specific frequency ranges (e.g., bass)
+                        val bassRange = magnitudes.slice(bassRangeStart until bassRangeEnd)
+                        val bassEnergy = bassRange.sum()
+
+                        Log.d(TAG, "Bass Energy: $bassEnergy") // Log bass energy for debugging
+
+                        if (bassEnergy > threshold && bassEnergy > minEnergy && System.currentTimeMillis() - lastBeat > cooldown) {
+                            lastBeat = System.currentTimeMillis()
+                            Log.d(TAG, "Beat detected! Bass energy: $bassEnergy")
+
+                            handler.post {
+                                val validCommands = commands.filter {
+                                    it.hexCode.isNotEmpty() && it.name.contains("Flash")
+                                }
+                                if (validCommands.isNotEmpty()) {
+                                    val command = validCommands.random()
+                                    Log.d(TAG, "Sending command: ${command.name}")
+                                    sendCode(command.hexCode)
+                                } else {
+                                    Log.e(TAG, "No valid commands found")
+                                }
+                            }
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Audio processing error", e)
+                }
+            }
+        }.apply { start() }
+    }
+
+    private fun toggleAudioSync() {
+        if (isSyncing) {
+            stopAudioSync()
+            syncButton.text = "Sync Music"
+        } else {
+            checkAudioPermission()
+            syncButton.text = "Stop Syncing"
+        }
+    }
+
+    private fun stopAudioSync() {
+        isSyncing = false
+        audioThread?.join()
+        audioRecord?.apply {
+            stop()
+            release()
+        }
+        audioRecord = null
+    }
+
 
     // Helper function to create EditText with box style
     private fun createBoxedEditText(hint: String, inputType: Int, defaultValue: String): EditText {
