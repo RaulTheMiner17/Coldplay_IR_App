@@ -47,6 +47,8 @@ class MainActivity : AppCompatActivity() {
 
     // Your command data (using Int for colors)
     private val commands = arrayOf(
+        CommandData("Learn", "", Color.GRAY),
+        CommandData("Send Learned", "", Color.LTGRAY),
         CommandData("Random Flash", "", Color.DKGRAY),
         CommandData("Random Fade 1", "", Color.DKGRAY),
         CommandData("Random Fade 2", "", Color.DKGRAY),
@@ -135,6 +137,7 @@ class MainActivity : AppCompatActivity() {
 
         )
 
+    private var learnedCode: String = ""
     private lateinit var usbManager: UsbManager
     private var connection: UsbDeviceConnection? = null
     private var device: UsbDevice? = null
@@ -454,65 +457,82 @@ class MainActivity : AppCompatActivity() {
     }
     private fun createCommandButtons() {
         commandContainer.removeAllViews() // Clear existing buttons
-
         val buttonWidth = dpToPx(97)
         val buttonHeight = dpToPx(80)
         val buttonMargin = dpToPx(8)
         val cornerRadius = dpToPx(20)
-
         val buttonLayoutParams = LinearLayout.LayoutParams(buttonWidth, buttonHeight).apply {
             setMargins(buttonMargin, buttonMargin, buttonMargin, buttonMargin)
         }
 
         // --- Button Creation ---
         var currentRowLayout: LinearLayout? = null
-
         for (i in commands.indices) {
             val command = commands[i]
-
             // Create a new row layout for every 3 buttons
-            if (i % 3 == 0 ) {
+            if (i % 3 == 0) {
                 currentRowLayout = LinearLayout(this).apply {
                     orientation = LinearLayout.HORIZONTAL
                     gravity = Gravity.CENTER
                 }
                 commandContainer.addView(currentRowLayout)
             }
-
-
             val button = Button(this).apply {
                 text = command.name
                 background = createRoundedRectDrawable(command.color, cornerRadius)
                 setTextColor(if (isColorDark(command.color)) Color.WHITE else Color.BLACK)
 
-                // Set onClickListener based on button type
-                if (command.name.startsWith("Random")) {
-                    // Random button: Store the *type*, not the hexCode.
+                // Special handling for Learn button
+                if (command.name == "Learn") {
+                    setOnClickListener { learnCode() }
+                }
+                // Special handling for Send Learned button
+                else if (command.name == "Send Learned") {
+                    setOnClickListener {
+                        if (learnedCode.isNotEmpty()) {
+                            if (!isSending) {
+                                isSending = true
+                                sendCount = 0
+                                currentCommandType = null
+                                sendCodeWithCountAndDelay(learnedCode)
+                            }
+                        } else {
+                            statusTextView.text = "No code has been learned yet."
+                        }
+                    }
+                }
+                // Random buttons
+                else if (command.name.startsWith("Random")) {
                     val type = command.name.substringAfter("Random ")
                     setOnClickListener {
                         if (!isSending) {
                             isSending = true
                             sendCount = 0
-                            currentCommandType = type  // Store the TYPE
-                            sendCodeWithCountAndDelay("") // Empty string - we'll pick randomly
+                            currentCommandType = type
+                            sendCodeWithCountAndDelay("")
                         }
                     }
-                } else {
-                    // Regular button:  NO hexCode needed here.
+                }
+                // Regular buttons
+                else {
                     setOnClickListener {
                         if (!isSending) {
                             isSending = true
                             sendCount = 0
-                            currentCommandType = null // Clear any previous random type
-                            sendCodeWithCountAndDelay(command.hexCode) //pass hexcode
+                            currentCommandType = null
+                            sendCodeWithCountAndDelay(command.hexCode)
                         }
                     }
                 }
-
                 layoutParams = buttonLayoutParams
                 gravity = Gravity.CENTER
             }
             currentRowLayout?.addView(button)
+        }
+
+        // Update the "Send Learned" button if we already have a learned code
+        if (learnedCode.isNotEmpty()) {
+            updateSendLearnedButton()
         }
     }
 
@@ -938,6 +958,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+
     private fun learnCode() {
         executorService.execute {
             if (device == null || connection == null || endpointOut == null || endpointIn == null) {
@@ -945,34 +966,37 @@ class MainActivity : AppCompatActivity() {
                 Log.e(TAG, "learnCode: device/connection/endpoints are null")
                 return@execute
             }
-
             try {
+                // Clear any pending data
                 flushInputBuffer()
+                // Send learn command
                 var sent = connection!!.bulkTransfer(endpointOut, C_LEARN, C_LEARN.size, 1000)
                 if (sent < 0) {
                     handler.post { statusTextView.text = "Error sending learn command." }
                     Log.e(TAG, "learnCode: Error sending learn command: $sent")
                     return@execute
                 }
-
+                handler.post {
+                    statusTextView.text = "Reading remote control codes.\n" +
+                            "Press a remote control button from less than a centimeter.\n" +
+                            "The dongle may be unusable until it returns some data.\n" +
+                            "If the code fails to replay, retry the capture."
+                }
                 val receivedData = receiveLearnData()
-
                 if (receivedData != null) {
-                    val learnedCode = byteArrayToHexString(receivedData)
+                    learnedCode = byteArrayToHexString(receivedData) // Store the learned code
                     handler.post {
-                        // Instead of setting to an EditText, we'll log it and update the status.
-                        // codeEditText.setText(learnedCode)  // Remove this line
-                        statusTextView.text = "Code learned: $learnedCode" // Show the learned code
+                        statusTextView.text = "Code learned successfully:\n$learnedCode"
+                        // Update the "Send Learned" button color to indicate it has a code
+                        updateSendLearnedButton()
                     }
                     Log.d(TAG, "Learned Code: $learnedCode")
-
                     try {
                         val decodedPulses = decodeLearned(receivedData)
                         Log.d(TAG, "Decoded Pulses $decodedPulses")
                     } catch (e: Exception) {
                         Log.e(TAG, "Error During decoding", e)
                     }
-
                 } else {
                     handler.post { statusTextView.text = "Error receiving learned code." }
                     Log.e(TAG, "learnCode: Error receiving code")
@@ -984,6 +1008,24 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun updateSendLearnedButton() {
+        // Find the "Send Learned" button in the commandContainer
+        for (i in 0 until commandContainer.childCount) {
+            val rowLayout = commandContainer.getChildAt(i) as? LinearLayout ?: continue
+            for (j in 0 until rowLayout.childCount) {
+                val button = rowLayout.getChildAt(j) as? Button ?: continue
+                if (button.text == "Send Learned") {
+                    // Update button color based on whether we have a learned code
+                    if (learnedCode.isNotEmpty()) {
+                        button.background = createRoundedRectDrawable(Color.GREEN, dpToPx(20))
+                    } else {
+                        button.background = createRoundedRectDrawable(Color.LTGRAY, dpToPx(20))
+                    }
+                    break
+                }
+            }
+        }
+    }
     private fun receiveLearnData(): ByteArray? {
         val buffer = ByteArray(64)
         var received: Int
